@@ -1,0 +1,80 @@
+# Home Assistant dashboard card for esphome/dometic-fridge.yaml
+# Dashboard > Edit > Add card > Manual, paste this.
+# Entity IDs assume the default device name "dometic-fridge"; adjust if yours differ.
+type: vertical-stack
+cards:
+  - type: heading
+    heading: Dometic Fridge
+    icon: mdi:fridge
+    badges:
+      - type: entity
+        entity: binary_sensor.dometic_fridge_ci_bus_connected
+        show_state: true
+        show_icon: true
+        color: green
+
+  - type: grid
+    columns: 2
+    square: false
+    cards:
+      - type: tile
+        entity: switch.dometic_fridge_power
+        name: Fridge
+        icon: mdi:fridge
+        color: blue
+        tap_action:
+          action: toggle
+      - type: tile
+        entity: sensor.dometic_fridge_power_source
+        name: Power source
+        icon: mdi:power-plug
+
+  - type: tile
+    entity: select.dometic_fridge_mode
+    name: Mode
+    color: cyan
+    features_position: bottom
+    features:
+      - type: select-options
+
+  - type: tile
+    entity: number.dometic_fridge_level
+    name: Level (1-5)
+    color: cyan
+    features_position: bottom
+    features:
+      - type: numeric-input
+        style: buttons
+
+  - type: grid
+    columns: 2
+    square: false
+    cards:
+      - type: tile
+        entity: binary_sensor.dometic_fridge_compressor
+        name: Compressor
+        color: amber
+      - type: tile
+        entity: binary_sensor.dometic_fridge_condenser_fan
+        name: Condenser fan
+        color: amber
+
+  - type: tile
+    entity: sensor.dometic_fridge_error
+    name: Error
+    icon: mdi:alert-circle-outline
+    color: red
+
+  - type: logbook
+    title: Fridge log
+    hours_to_show: 24
+    target:
+      entity_id:
+        - switch.dometic_fridge_power
+        - select.dometic_fridge_mode
+        - number.dometic_fridge_level
+        - binary_sensor.dometic_fridge_compressor
+        - binary_sensor.dometic_fridge_condenser_fan
+        - sensor.dometic_fridge_error
+        - binary_sensor.dometic_fridge_ci_bus_connected
+        - sensor.dometic_fridge_status_frame_0x0c

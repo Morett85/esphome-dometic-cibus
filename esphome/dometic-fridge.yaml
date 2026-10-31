@@ -1,0 +1,444 @@
+##############################################################################
+# Dometic 10-series compressor fridge (RC / RCL / RCS / RCD 10) via CI-BUS
+# ESPHome >= 2026.10, ESP32 (classic), framework ESP-IDF
+#
+# Read status (LIN ID 0x0C) and control power, mode and level (LIN ID 0x0B).
+# Tested on a Dometic RCL 10.4EP with an FST T151 LIN transceiver module.
+# Protocol notes: see README.md
+##############################################################################
+
+substitutions:
+  name: dometic-fridge
+  friendly_name: Dometic Fridge
+  # GPIO numbers as plain numbers (used in YAML and in C++ lambdas).
+  # TX = ESP32 output -> transceiver TXD input
+  # RX = transceiver RXD output -> ESP32 input
+  # Verify with your board: on our FST T151 the terminals were the other way
+  # round compared to the silkscreen we expected (see README, "Wiring").
+  lin_tx_gpio: "27"
+  lin_rx_gpio: "26"
+
+esphome:
+  name: ${name}
+  friendly_name: ${friendly_name}
+  min_version: 2026.10.0
+
+esp32:
+  board: esp32dev
+  framework:
+    type: esp-idf
+
+logger:
+  level: INFO
+
+api:
+  encryption:
+    key: !secret api_encryption_key
+
+ota:
+  - platform: esphome
+    encryption: {}   # uses the api encryption key
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+
+time:
+  - platform: homeassistant
+    id: ha_time
+
+uart:
+  - id: dometic_lin_uart
+    tx_pin: GPIO${lin_tx_gpio}
+    rx_pin:
+      number: GPIO${lin_rx_gpio}
+      mode:
+        input: true
+        pullup: true
+    baud_rate: 19200
+    data_bits: 8
+    parity: NONE
+    stop_bits: 1
+    rx_buffer_size: 256
+
+globals:
+  # Last valid status frame (LIN ID 0x0C), data bytes D0..D7
+  - id: dom_have_status
+    type: bool
+    restore_value: false
+    initial_value: 'false'
+  - id: dom_st_ms
+    type: uint32_t
+    restore_value: false
+    initial_value: '0'
+  - id: dom_st0
+    type: uint8_t
+    restore_value: false
+    initial_value: '0'
+  - id: dom_st1
+    type: uint8_t
+    restore_value: false
+    initial_value: '0'
+  - id: dom_st2
+    type: uint8_t
+    restore_value: false
+    initial_value: '0'
+  - id: dom_st6
+    type: uint8_t
+    restore_value: false
+    initial_value: '0'
+  - id: dom_st7
+    type: uint8_t
+    restore_value: false
+    initial_value: '0'
+  - id: dom_last_frame
+    type: std::string
+    restore_value: false
+    initial_value: '""'
+  # Control: the 0x0B heartbeat starts with the first user command and then stays on
+  - id: dom_ctrl_enabled
+    type: bool
+    restore_value: true
+    initial_value: 'false'
+  - id: dom_cmd_pending
+    type: int
+    restore_value: false
+    initial_value: '0'
+  - id: dom_cmd_power
+    type: bool
+    restore_value: false
+    initial_value: 'false'
+  - id: dom_cmd_mode
+    type: int
+    restore_value: false
+    initial_value: '0'
+  - id: dom_cmd_step
+    type: int
+    restore_value: false
+    initial_value: '1'
+  # Watchdog: re-apply the UART pins if the fridge stops answering
+  - id: dom_fail_count
+    type: int
+    restore_value: false
+    initial_value: '0'
+  - id: dom_last_reinit_ms
+    type: uint32_t
+    restore_value: false
+    initial_value: '0'
+  - id: dom_err_logged
+    type: bool
+    restore_value: false
+    initial_value: 'false'
+
+script:
+  # Status request: BREAK + SYNC 0x55 + PID 0x4C (ID 0x0C). The fridge answers
+  # with 8 data bytes + enhanced checksum. The transceiver also echoes our header.
+  - id: fridge_poll
+    mode: single
+    then:
+      - lambda: |-
+          const uart_port_t port = static_cast<uart_port_t>(id(dometic_lin_uart).get_hw_serial_number());
+          if (port >= UART_NUM_MAX) return;
+          id(dom_fail_count)++;
+          uart_set_rx_full_threshold(port, 1);
+          uart_set_rx_timeout(port, 2);
+          gpio_set_pull_mode(static_cast<gpio_num_t>(${lin_rx_gpio}), GPIO_PULLUP_ONLY);
+          uart_flush_input(port);
+
+          // BREAK: one 0x00 byte at half baud rate = ~18 bit times low at 19200 baud
+          const uint8_t z = 0x00;
+          if (uart_set_baudrate(port, 9600) != ESP_OK) return;
+          uart_write_bytes(port, reinterpret_cast<const char *>(&z), 1);
+          uart_wait_tx_done(port, pdMS_TO_TICKS(50));
+          uart_set_baudrate(port, 19200);
+          const uint8_t hdr[2] = {0x55, 0x4C};
+          uart_write_bytes(port, reinterpret_cast<const char *>(hdr), 2);
+          uart_wait_tx_done(port, pdMS_TO_TICKS(50));
+
+          uint8_t rx[32];
+          const int n = uart_read_bytes(port, rx, sizeof(rx), pdMS_TO_TICKS(85));
+
+          // Find the echoed SYNC+PID, then 8 data bytes + checksum
+          int off = -1;
+          for (int i = 0; i + 1 < n; i++) {
+            if (rx[i] == 0x55 && rx[i + 1] == 0x4C) { off = i + 2; break; }
+          }
+          bool valid = false;
+          if (off >= 0 && n - off >= 9) {
+            unsigned sum = 0x4C;  // enhanced checksum includes the PID
+            for (int i = 0; i < 8; i++) { sum += rx[off + i]; sum = (sum & 0xFFu) + (sum >> 8); }
+            valid = (static_cast<uint8_t>(~sum) == rx[off + 8]);
+          }
+          if (!valid) {
+            if (!id(dom_err_logged)) {
+              ESP_LOGW("dometic", "No valid status frame (received %d bytes)", n);
+              id(dom_err_logged) = true;
+            }
+            return;
+          }
+
+          const uint8_t *d = rx + off;
+          if (id(dom_err_logged)) ESP_LOGW("dometic", "Fridge is answering again");
+          id(dom_err_logged) = false;
+          id(dom_fail_count) = 0;
+          id(dom_st0) = d[0]; id(dom_st1) = d[1]; id(dom_st2) = d[2]; id(dom_st6) = d[6]; id(dom_st7) = d[7];
+          id(dom_have_status) = true;
+          id(dom_st_ms) = millis();
+
+          char hex[32];
+          snprintf(hex, sizeof(hex), "%02X %02X %02X %02X %02X %02X %02X %02X",
+                   d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7]);
+          if (id(dom_last_frame) != hex) {
+            ESP_LOGW("dometic", "Status 0x0C: %s", hex);
+            id(dom_last_frame) = hex;
+            id(fridge_frame).publish_state(hex);
+          }
+
+          // Pending command confirmed by the fridge?
+          if (id(dom_cmd_pending) > 0 &&
+              ((d[0] >> 3) & 3) == id(dom_cmd_mode) && d[1] == id(dom_cmd_step) &&
+              ((d[7] & 0x80) != 0) == id(dom_cmd_power)) {
+            id(dom_cmd_pending) = 0;
+            ESP_LOGW("dometic", "Command CONFIRMED: power=%d mode=%d level=%d",
+                     (int) id(dom_cmd_power), id(dom_cmd_mode), id(dom_cmd_step));
+          }
+
+  # Control frame: LIN ID 0x0B (PID 0x8B), 8 data bytes, enhanced checksum.
+  #   D0 = 0x20 | mode << 3 | power source bits (copied from status D0 bits 0-1)
+  #   D1 = level 1..5      D2 = 0x80      D3..D6 = 0x00
+  #   D7 = power << 7 | SYNC << 3   (SYNC = pulse that makes the fridge apply it)
+  # Without a pending command the frame mirrors the current status (heartbeat).
+  - id: fridge_send_ctrl
+    mode: queued
+    parameters:
+      sync: bool
+    then:
+      - lambda: |-
+          const uart_port_t port = static_cast<uart_port_t>(id(dometic_lin_uart).get_hw_serial_number());
+          if (port >= UART_NUM_MAX || !id(dom_have_status)) return;
+          const bool cmd = id(dom_cmd_pending) > 0;
+          const uint8_t st0 = id(dom_st0), st1 = id(dom_st1), st7 = id(dom_st7);
+          const int mode = cmd ? id(dom_cmd_mode) : ((st0 >> 3) & 3);
+          int step = cmd ? id(dom_cmd_step) : st1;
+          if (step < 1) step = 1;
+          if (step > 5) step = 5;
+          const bool power = cmd ? id(dom_cmd_power) : ((st7 & 0x80) != 0);
+
+          uint8_t f[11];
+          f[0] = 0x55;
+          f[1] = 0x8B;
+          f[2] = static_cast<uint8_t>(0x20 | ((mode & 3) << 3) | (st0 & 3));
+          f[3] = static_cast<uint8_t>(step);
+          f[4] = 0x80; f[5] = 0; f[6] = 0; f[7] = 0; f[8] = 0;
+          f[9] = static_cast<uint8_t>((power ? 0x80 : 0) | (sync ? 0x08 : 0));
+          unsigned sum = f[1];
+          for (int i = 2; i < 10; i++) { sum += f[i]; sum = (sum & 0xFFu) + (sum >> 8); }
+          f[10] = static_cast<uint8_t>(~sum);
+
+          uart_wait_tx_done(port, pdMS_TO_TICKS(50));
+          const uint8_t z = 0x00;
+          if (uart_set_baudrate(port, 9600) != ESP_OK) return;
+          uart_write_bytes(port, reinterpret_cast<const char *>(&z), 1);
+          uart_wait_tx_done(port, pdMS_TO_TICKS(50));
+          uart_set_baudrate(port, 19200);
+          uart_write_bytes(port, reinterpret_cast<const char *>(f), sizeof(f));
+          uart_wait_tx_done(port, pdMS_TO_TICKS(50));
+          if (cmd)
+            ESP_LOGI("dometic", "Control 0x0B %s: %02X %02X %02X 00 00 00 00 %02X",
+                     sync ? "SYNC" : "    ", f[2], f[3], f[4], f[9]);
+
+interval:
+  - interval: 1s
+    then:
+      - lambda: |-
+          // Watchdog: in our tests the fridge stayed silent after a cold boot of the
+          // ESP32 and answered immediately once the UART pins were applied again.
+          if (id(dom_fail_count) >= 5 && millis() - id(dom_last_reinit_ms) > 30000) {
+            const uart_port_t port = static_cast<uart_port_t>(id(dometic_lin_uart).get_hw_serial_number());
+            if (port < UART_NUM_MAX) {
+              uart_set_pin(port, ${lin_tx_gpio}, ${lin_rx_gpio}, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
+              gpio_set_pull_mode(static_cast<gpio_num_t>(${lin_rx_gpio}), GPIO_PULLUP_ONLY);
+              uart_flush_input(port);
+              ESP_LOGW("dometic", "No answer for %d requests: re-applying UART pins", id(dom_fail_count));
+            }
+            id(dom_last_reinit_ms) = millis();
+            id(dom_fail_count) = 0;
+          }
+
+          const bool fresh = id(dom_have_status) && (millis() - id(dom_st_ms) < 10000);
+          if (id(dom_cmd_pending) > 0 && !fresh) {
+            id(dom_cmd_pending) = 0;
+            ESP_LOGW("dometic", "Command cancelled: no recent status from the fridge");
+          }
+          if (id(dom_ctrl_enabled) && fresh) {
+            if (id(dom_cmd_pending) > 0) {
+              // Frame with SYNC, 40 ms, same frame without SYNC, 35 ms
+              id(fridge_send_ctrl).execute(true);
+              delay(40);
+              id(fridge_send_ctrl).execute(false);
+              delay(35);
+              if (--id(dom_cmd_pending) == 0)
+                ESP_LOGW("dometic", "Command NOT confirmed after 8 attempts");
+            } else {
+              id(fridge_send_ctrl).execute(false);
+              delay(10);
+            }
+          }
+      - script.execute: fridge_poll
+
+switch:
+  - platform: template
+    name: Power
+    icon: mdi:fridge
+    restore_mode: DISABLED   # never act at boot, state comes from the fridge
+    lambda: |-
+      if (!id(dom_have_status)) return {};
+      return (id(dom_st7) & 0x80) != 0;
+    turn_on_action:
+      - lambda: |-
+          if (!id(dom_have_status)) { ESP_LOGW("dometic", "Fridge status unknown, command ignored"); return; }
+          if (id(dom_cmd_pending) <= 0) {
+            id(dom_cmd_mode) = (id(dom_st0) >> 3) & 3;
+            id(dom_cmd_step) = id(dom_st1) < 1 ? 1 : (id(dom_st1) > 5 ? 5 : id(dom_st1));
+          }
+          id(dom_cmd_power) = true;
+          id(dom_cmd_pending) = 8;
+          id(dom_ctrl_enabled) = true;
+    turn_off_action:
+      - lambda: |-
+          if (!id(dom_have_status)) { ESP_LOGW("dometic", "Fridge status unknown, command ignored"); return; }
+          if (id(dom_cmd_pending) <= 0) {
+            id(dom_cmd_mode) = (id(dom_st0) >> 3) & 3;
+            id(dom_cmd_step) = id(dom_st1) < 1 ? 1 : (id(dom_st1) > 5 ? 5 : id(dom_st1));
+          }
+          id(dom_cmd_power) = false;
+          id(dom_cmd_pending) = 8;
+          id(dom_ctrl_enabled) = true;
+
+select:
+  - platform: template
+    name: Mode
+    icon: mdi:snowflake-variant
+    options: ["Performance", "Silent", "Turbo"]
+    update_interval: 2s
+    lambda: |-
+      if (!id(dom_have_status)) return {};
+      switch ((id(dom_st0) >> 3) & 3) {
+        case 0: return std::string("Performance");
+        case 2: return std::string("Silent");
+        case 3: return std::string("Turbo");
+        default: return {};
+      }
+    set_action:
+      - lambda: |-
+          if (!id(dom_have_status)) { ESP_LOGW("dometic", "Fridge status unknown, command ignored"); return; }
+          if (id(dom_cmd_pending) <= 0) {
+            id(dom_cmd_power) = (id(dom_st7) & 0x80) != 0;
+            id(dom_cmd_step) = id(dom_st1) < 1 ? 1 : (id(dom_st1) > 5 ? 5 : id(dom_st1));
+          }
+          id(dom_cmd_mode) = (x == "Silent") ? 2 : ((x == "Turbo") ? 3 : 0);
+          id(dom_cmd_pending) = 8;
+          id(dom_ctrl_enabled) = true;
+
+number:
+  - platform: template
+    name: Level
+    icon: mdi:thermometer-lines
+    min_value: 1
+    max_value: 5
+    step: 1
+    mode: slider
+    update_interval: 2s
+    lambda: |-
+      if (!id(dom_have_status)) return {};
+      return (float) id(dom_st1);
+    set_action:
+      - lambda: |-
+          if (!id(dom_have_status)) { ESP_LOGW("dometic", "Fridge status unknown, command ignored"); return; }
+          if (id(dom_cmd_pending) <= 0) {
+            id(dom_cmd_power) = (id(dom_st7) & 0x80) != 0;
+            id(dom_cmd_mode) = (id(dom_st0) >> 3) & 3;
+          }
+          id(dom_cmd_step) = (int) x;
+          id(dom_cmd_pending) = 8;
+          id(dom_ctrl_enabled) = true;
+
+binary_sensor:
+  - platform: template
+    name: Compressor
+    icon: mdi:engine
+    lambda: |-
+      if (!id(dom_have_status)) return {};
+      return (id(dom_st0) & 0x40) != 0;
+  - platform: template
+    name: Condenser fan
+    icon: mdi:fan
+    lambda: |-
+      if (!id(dom_have_status)) return {};
+      return (id(dom_st2) & 0x02) != 0;
+  - platform: template
+    name: CI-BUS connected
+    device_class: connectivity
+    entity_category: diagnostic
+    lambda: |-
+      return id(dom_have_status) && (millis() - id(dom_st_ms) < 10000);
+
+sensor:
+  - platform: template
+    name: Error code
+    icon: mdi:alert-circle-outline
+    accuracy_decimals: 0
+    update_interval: 5s
+    lambda: |-
+      if (!id(dom_have_status)) return {};
+      return (float) (id(dom_st6) & 0x7F);
+
+text_sensor:
+  - platform: template
+    name: Error
+    icon: mdi:alert-circle-outline
+    update_interval: 5s
+    lambda: |-
+      if (!id(dom_have_status)) return {};
+      switch (id(dom_st6) & 0x7F) {
+        case 0:  return std::string("none");
+        case 1:  return std::string("W01 defrost sensor NTC1 defective");
+        case 2:  return std::string("W02 fridge air sensor NTC2 defective");
+        case 3:  return std::string("E03 no connection display - power module");
+        case 4:  return std::string("W04 no connection to CI master");
+        case 10: return std::string("W10 door open > 2 min");
+        case 11: return std::string("W11 battery voltage out of range");
+        case 14: return std::string("W14 evaporator fan defective");
+        case 17: return std::string("W17 defrost heater current low");
+        case 18: return std::string("E18 defrost heater current high");
+        case 19: return std::string("W19 battery voltage low");
+        case 26: return std::string("W26 ambient sensor defective");
+        case 32: return std::string("E32 condenser fan over-current");
+        case 33: return std::string("E33 compressor does not start");
+        case 34: return std::string("E34 compressor overload");
+        case 35: return std::string("E35 controller over-temperature");
+        default: return std::string("unknown");
+      }
+  - platform: template
+    name: Power source
+    icon: mdi:power-plug
+    update_interval: 5s
+    lambda: |-
+      if (!id(dom_have_status)) return {};
+      switch (id(dom_st0) & 3) {
+        case 0: return std::string("AC");
+        case 1: return std::string("DC24");
+        case 2: return std::string("DC12");
+        default: return std::string("unknown");
+      }
+  - platform: template
+    id: fridge_frame
+    name: Status frame 0x0C
+    icon: mdi:code-array
+    entity_category: diagnostic
+    update_interval: never
+
+button:
+  - platform: restart
+    name: Restart
+    entity_category: diagnostic
